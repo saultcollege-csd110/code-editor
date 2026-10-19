@@ -47,15 +47,133 @@ $('#clear').onclick=()=>$('#console').textContent='';
 function setRunning(v){$('#run').disabled=v||!supported;$('#stop').disabled=!v}function setWaiting(v){waiting=v;$('#stdin').disabled=!v;$('#send').disabled=!v;if(v){$('#stdin').focus()}else $('#stdin').value=''}
 // The worker is embedded to keep the app self-contained apart from the COI helper and CDN libraries.
 const workerSource=String.raw`
-let pyodide,control,bytes;
+let pyodide,control,bytes,initialized=false,executing=false,inputQueue=[];
 const send=(type,extra={})=>postMessage({type,...extra});
-function stdin(){Atomics.store(control,0,0);send('input');Atomics.wait(control,0,0);const n=Atomics.load(control,1);if(n<0)throw Error('Input cancelled');return new TextDecoder().decode(bytes.subarray(0,n))+'\n'}
+// Pyodide's stdin callback must return ONE byte (0..255), not a string.
+function stdin(){
+  if(!inputQueue.length){
+    Atomics.store(control,0,0);
+    send('input');
+    Atomics.wait(control,0,0);
+    const n=Atomics.load(control,1);
+    if(n<0)return null;
+    inputQueue=Array.from(bytes.subarray(0,n));
+    inputQueue.push(10); // Enter adds the newline consumed by Python input().
+  }
+  return inputQueue.shift();
+}
+function removeTree(path){
+  const fs=pyodide.FS;
+  if(!fs.analyzePath(path).exists)return;
+  for(const name of fs.readdir(path)){
+    if(name==='.'||name==='..')continue;
+    const child=path+'/'+name;
+    if(fs.isDir(fs.stat(child).mode))removeTree(child);
+    else fs.unlink(child);
+  }
+  fs.rmdir(path);
+}
 function walk(dir,out){for(const item of pyodide.FS.readdir(dir)){if(item==='.'||item==='..'||item==='__pycache__'||item==='.git')continue;const full=dir+'/'+item,relative=full.slice('/project/'.length);const info=pyodide.FS.stat(full);if(pyodide.FS.isDir(info.mode)){out.folders.push(relative);walk(full,out)}else if(pyodide.FS.isFile(info.mode)){const data=pyodide.FS.readFile(full);if(data.length>2000000)continue;try{out.files[relative]=new TextDecoder('utf-8',{fatal:true}).decode(data)}catch{}}}}
-onmessage=async e=>{if(e.data.type!=='run')return;try{control=new Int32Array(e.data.buffer,0,8);bytes=new Uint8Array(e.data.buffer,32);send('loading');importScripts('https://cdn.jsdelivr.net/pyodide/v0.29.3/full/pyodide.js');pyodide=await loadPyodide({indexURL:'https://cdn.jsdelivr.net/pyodide/v0.29.3/full/'});pyodide.setStdout({write:b=>{send('stdout',{text:new TextDecoder().decode(b)});return b.length}});pyodide.setStderr({batched:t=>send('stderr',{text:t+'\n'})});pyodide.setStdin({stdin});pyodide.FS.mkdirTree('/project');for(const folder of e.data.folders)pyodide.FS.mkdirTree('/project/'+folder);for(const [path,contents] of Object.entries(e.data.files)){const parts=path.split('/');if(parts.length>1)pyodide.FS.mkdirTree('/project/'+parts.slice(0,-1).join('/'));pyodide.FS.writeFile('/project/'+path,contents)}send('ready');try{await pyodide.runPythonAsync('import os,sys\nos.chdir("/project")\nif "/project" not in sys.path: sys.path.insert(0,"/project")\nwith open("main.py",encoding="utf-8") as f:\n    source=f.read()\nexec(compile(source,"main.py","exec"),{"__name__":"__main__","__file__":"/project/main.py"})')}catch(err){send('stderr',{text:String(err)+'\n'})}const result={files:{},folders:[]};walk('/project',result);send('synced',{result});send('finished')}catch(err){send('stderr',{text:String(err)+'\n'});send('finished')}};`;
+async function initialize(){
+  if(initialized)return;
+  send('loading');
+  importScripts('https://cdn.jsdelivr.net/pyodide/v0.29.3/full/pyodide.js');
+  pyodide=await loadPyodide({indexURL:'https://cdn.jsdelivr.net/pyodide/v0.29.3/full/'});
+  pyodide.setStdout({batched:t=>send('stdout',{text:t+'\n'})});
+  pyodide.setStderr({batched:t=>send('stderr',{text:t+'\n'})});
+  pyodide.setStdin({stdin});
+  initialized=true;
+  send('loaded');
+}
+async function run(data){
+  if(executing)return;
+  executing=true;
+  try{
+    await initialize();
+    control=new Int32Array(data.buffer,0,8);
+    bytes=new Uint8Array(data.buffer,32);
+    inputQueue=[];
+    // Remove files and Python imports from the previous execution.
+    await pyodide.runPythonAsync('import sys, importlib\nfor name, module in list(sys.modules.items()):\n    if getattr(module, "__file__", "") and str(module.__file__).startswith("/project/"):\n        del sys.modules[name]\nimportlib.invalidate_caches()');
+    removeTree('/project');
+    pyodide.FS.mkdirTree('/project');
+    for(const folder of data.folders)pyodide.FS.mkdirTree('/project/'+folder);
+    for(const [path,contents] of Object.entries(data.files)){
+      const parts=path.split('/');
+      if(parts.length>1)pyodide.FS.mkdirTree('/project/'+parts.slice(0,-1).join('/'));
+      pyodide.FS.writeFile('/project/'+path,contents);
+    }
+    send('ready');
+    try{
+      await pyodide.runPythonAsync('import os,sys\nos.chdir("/project")\nif "/project" not in sys.path: sys.path.insert(0,"/project")\nwith open("main.py",encoding="utf-8") as f:\n    source=f.read()\nexec(compile(source,"main.py","exec"),{"__name__":"__main__","__file__":"/project/main.py"})');
+    }catch(err){send('stderr',{text:String(err)+'\n'})}
+    const result={files:{},folders:[]};
+    walk('/project',result);
+    send('synced',{result});
+  }catch(err){send('stderr',{text:String(err)+'\n'})}
+  finally{executing=false;send('finished')}
+}
+onmessage=e=>{if(e.data.type==='run')void run(e.data)};
+`;
 const supported=typeof SharedArrayBuffer!=='undefined'&&crossOriginIsolated;
-function stop(silent=false){runId++;if(worker){worker.terminate();worker=null}channel=null;setWaiting(false);setRunning(false);if(!silent){status('Stopped');log('\n[Execution stopped; unsynchronized changes may be lost]\n','error')}}
+function stop(silent=false){
+  runId++;
+  if(worker){worker.terminate();worker=null}
+  channel=null;
+  setWaiting(false);
+  setRunning(false);
+  if(!silent){status('Stopped');log('\n[Execution stopped; unsynchronized changes may be lost]\n','error')}
+}
 $('#stop').onclick=()=>stop();
-$('#run').onclick=()=>{if(!supported)return;flush();const p=project();if(!('main.py' in p.files)){alert('Create main.py before running this project.');return}stop(true);$('#console').textContent='';setRunning(true);status('Loading Python…');const current=++runId,projectId=p.id;channel=new SharedArrayBuffer(32+65536);const url=URL.createObjectURL(new Blob([workerSource],{type:'text/javascript'}));worker=new Worker(url);URL.revokeObjectURL(url);worker.onmessage=e=>{if(current!==runId)return;const {type,text,result}=e.data;if(type==='loading')status('Loading Pyodide…');if(type==='ready')status('Running…');if(type==='stdout')log(text);if(type==='stderr')log(text,'error');if(type==='input')setWaiting(true);if(type==='synced'){const target=state.projects.find(x=>x.id===projectId);if(target){target.files={...result.files};target.folders=[...new Set(result.folders)];if(!(target.active in target.files))target.active=Object.keys(target.files)[0]||'main.py';if(state.selected===projectId){loadingDocument=true;editor.dispatch({changes:{from:0,to:editor.state.doc.length,insert:target.files[target.active]||''}});loadingDocument=false;$('#filebar').textContent=target.active;renderTree()}flush()}}if(type==='finished'){setWaiting(false);setRunning(false);status('Finished');worker?.terminate();worker=null;channel=null}};worker.onerror=e=>{if(current!==runId)return;log('Worker error: '+e.message+'\n','error');stop(true);status('Execution failed')};worker.postMessage({type:'run',files:clone(p.files),folders:[...p.folders],buffer:channel})};
+function createWorker(){
+  const url=URL.createObjectURL(new Blob([workerSource],{type:'text/javascript'}));
+  worker=new Worker(url);
+  URL.revokeObjectURL(url);
+  worker.onmessage=e=>{
+    const {type,text,result}=e.data;
+    if(type==='loading')status('Loading Pyodide (first run)…');
+    if(type==='loaded')status('Python ready');
+    if(type==='ready')status('Running…');
+    if(type==='stdout')log(text);
+    if(type==='stderr')log(text,'error');
+    if(type==='input')setWaiting(true);
+    if(type==='synced'){
+      const target=state.projects.find(x=>x.id===activeProjectId);
+      if(target){
+        target.files={...result.files};
+        target.folders=[...new Set(result.folders)];
+        if(!(target.active in target.files))target.active=Object.keys(target.files)[0]||'main.py';
+        if(state.selected===activeProjectId){
+          loadingDocument=true;
+          editor.dispatch({changes:{from:0,to:editor.state.doc.length,insert:target.files[target.active]||''}});
+          loadingDocument=false;
+          $('#filebar').textContent=target.active;
+          renderTree();
+        }
+        flush();
+      }
+    }
+    if(type==='finished'){
+      setWaiting(false);setRunning(false);status('Finished (Python ready)');channel=null;
+      // Keep the initialized worker for subsequent runs.
+    }
+  };
+  worker.onerror=e=>{log('Worker error: '+e.message+'\n','error');stop(true);status('Execution failed')};
+}
+let activeProjectId=null;
+$('#run').onclick=()=>{
+  if(!supported)return;
+  flush();
+  const p=project();
+  if(!('main.py' in p.files)){alert('Create main.py before running this project.');return}
+  $('#console').textContent='';
+  setRunning(true);
+  status(worker?'Preparing Python…':'Loading Python…');
+  activeProjectId=p.id;
+  channel=new SharedArrayBuffer(32+65536);
+  if(!worker)createWorker();
+  worker.postMessage({type:'run',files:clone(p.files),folders:[...p.folders],buffer:channel});
+};
 $('#inputRow').onsubmit=e=>{e.preventDefault();if(!waiting||!channel)return;const text=$('#stdin').value,encoded=new TextEncoder().encode(text),control=new Int32Array(channel,0,8),bytes=new Uint8Array(channel,32);if(encoded.length>bytes.length){log('[Input too long]\n','error');return}bytes.set(encoded);Atomics.store(control,1,encoded.length);log(text+'\n','inputEcho');setWaiting(false);Atomics.store(control,0,1);Atomics.notify(control,0,1)};
 const divider=$('#divider'),editorEl=$('#editor'),main=$('#main');function split(p){p=Math.max(12,Math.min(88,p));editorEl.style.height=p+'%';editorEl.style.flexShrink='0';return p}const saved=Number(localStorage.getItem(SPLIT));split(saved>=12&&saved<=88?saved:57);let dragging=false;divider.onpointerdown=e=>{if(e.button!==0)return;dragging=true;divider.setPointerCapture(e.pointerId);divider.classList.add('dragging')};divider.onpointermove=e=>{if(!dragging)return;const r=main.getBoundingClientRect();split((e.clientY-r.top-$('#filebar').offsetHeight)/(r.height-$('#filebar').offsetHeight)*100)};function finish(){if(!dragging)return;dragging=false;divider.classList.remove('dragging');localStorage.setItem(SPLIT,editorEl.getBoundingClientRect().height/(main.getBoundingClientRect().height-$('#filebar').offsetHeight)*100)}divider.onpointerup=finish;divider.onpointercancel=finish;divider.onkeydown=e=>{if(e.key==='ArrowUp'||e.key==='ArrowDown'){e.preventDefault();const p=editorEl.getBoundingClientRect().height/(main.getBoundingClientRect().height-$('#filebar').offsetHeight)*100;localStorage.setItem(SPLIT,split(p+(e.key==='ArrowDown'?3:-3)))}};
 if(!supported){$('#notice').style.display='block';$('#notice').textContent='Python execution requires cross-origin isolation. Deploy with coi-serviceworker.js on GitHub Pages (HTTPS), or serve with COOP/COEP headers. Editing and ZIP export still work.';$('#run').disabled=true}refresh();if(!supported)status('Execution unavailable: hosting setup needed');
